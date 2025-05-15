@@ -66,3 +66,16 @@ Currently, submissions to this codebase as a benchmark are closed as we figure o
 #### Bugs & Etc.
 
 If you find a bug, open an issue! L:D If you have a success story, let me know! It helps me understand what works and doesn't more than you might expect -- if I know how this is specifically helping people, that can help me further improve as a developer, as I can keep that in mind when developing other software for people in the future. :D :)
+
+
+
+## NOTE FOR SEBASTIAN
+
+check your environment so tinygrad can link the headers in CUDA
+```bash
+export CUDA_PATH=/home/sebastian.cavada/micromamba/envs/tiny/lib/python3.12/site-packages/nvidia/cuda_runtime
+```
+
+```
+PATCHES SIZES torch.Size([480500, 3, 2, 2])
+```

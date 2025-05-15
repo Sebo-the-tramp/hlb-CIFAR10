@@ -8,6 +8,17 @@ try:
 except NameError:
   pass ## we're still good
 """
+
+import sys
+sys.path.append("/home/sebastian.cavada/Documents/scsv/tiny_experiment/tinygrad") # add the parent directory to the path so we can import from it
+
+from tinygrad import getenv, dtypes
+from tinygrad.nn.datasets import cifar
+if getenv("TINY_BACKEND"): import tinygrad.frontend.torch
+
+from tinygrad import Device
+print(Device.DEFAULT)
+
 import functools
 from functools import partial
 import math
@@ -21,11 +32,7 @@ from torch import nn
 import torchvision
 from torchvision import transforms
 
-from tinygrad import getenv, dtypes
-from tinygrad.nn.datasets import cifar
-if getenv("TINY_BACKEND"): import tinygrad.frontend.torch
-
-# torch.set_default_dtype(torch.float16) # set the default dtype to float16 for the whole file
+# torch.set_default_dtype(torch.float16) # set the default dtype to float16 for the whole script
 
 ## <-- teaching comments
 # <-- functional comments
@@ -48,7 +55,7 @@ if getenv("TINY_BACKEND"): import tinygrad.frontend.torch
 # set global defaults (in this particular file) for convolutions
 default_conv_kwargs = {'kernel_size': 3, 'padding': 'same', 'bias': False}
 
-batchsize = 16
+batchsize = 128
 bias_scaler = 64
 # To replicate the ~95.79%-accuracy-in-110-seconds runs, you can change the base_depth from 64->128, train_epochs from 12.1->90, ['ema'] epochs 10->80, cutmix_size 3->10, and cutmix_epochs 6->80
 hyp = {
@@ -67,8 +74,8 @@ hyp = {
             'num_examples': 500,
         },
         'batch_norm_momentum': .4, # * Don't forget momentum is 1 - momentum here (due to a quirk in the original paper... >:( )
-        'cutmix_size': 0,
-        'cutmix_epochs': 0,
+        'cutmix_size': 3,
+        'cutmix_epochs': 6,
         'pad_amount': 2,
         'base_depth': 64 ## This should be a factor of 8 in some way to stay tensor core friendly
     },
@@ -99,9 +106,9 @@ if not os.path.exists(hyp['misc']['data_location']):
 
         # use the dataloader to get a single batch of all of the dataset items at once.
         train_dataset_gpu_loader = torch.utils.data.DataLoader(cifar10, batch_size=len(cifar10), drop_last=True,
-                                                  shuffle=True, num_workers=2, persistent_workers=False)
+                                                  shuffle=True, num_workers=0, persistent_workers=False)
         eval_dataset_gpu_loader = torch.utils.data.DataLoader(cifar10_eval, batch_size=len(cifar10_eval), drop_last=True,
-                                                  shuffle=False, num_workers=1, persistent_workers=False)
+                                                  shuffle=False, num_workers=0, persistent_workers=False)
 
         train_dataset_gpu = {}
         eval_dataset_gpu = {}
@@ -127,9 +134,10 @@ if not os.path.exists(hyp['misc']['data_location']):
         }
 
         ## Convert dataset to FP16 now for the rest of the process....
-        data['train']['images'] = data['train']['images'].float().half().requires_grad_(False)
-        data['eval']['images']  = data['eval']['images'].float().half().requires_grad_(False)
+        data['train']['images'] = data['train']['images'].half().requires_grad_(False)
+        data['eval']['images']  = data['eval']['images'].half().requires_grad_(False)
 
+        print("HERE IS THE PROBLEM COMING")
         # Convert this to one-hot to support the usage of cutmix (or whatever strange label tricks/magic you desire!)
         data['train']['targets'] = F.one_hot(data['train']['targets']).float().half()
         data['eval']['targets'] = F.one_hot(data['eval']['targets']).float().half()
@@ -231,6 +239,7 @@ def get_patches(x, patch_shape=(3, 3), dtype=torch.float32):
     # to extract a _view_ (i.e., there's no data copied here) of blocks in the input tensor. We have to do it twice -- once horizontally, once vertically. Then
     # from that, we get our kernel_size*kernel_size patches to later calculate the statistics for the whitening tensor on :D
     c, (h, w) = x.shape[1], patch_shape
+    print(dtype)
     return x.unfold(2,h,1).unfold(3,w,1).transpose(1,3).reshape(-1,c,h,w).to(dtype) # TODO: Annotate?
 
 def get_whitening_parameters(patches):
@@ -239,8 +248,11 @@ def get_whitening_parameters(patches):
     # the most significant features of the inputs each have their own axis. This significantly cleans things up for the
     # rest of the neural network and speeds up training.
     n,c,h,w = patches.shape
+    print("PATCHES SIZES", patches.shape)
     est_covariance = torch.cov(patches.view(n, c*h*w).t())
+    print("GETTING TO TORCH LINALG")
     eigenvalues, eigenvectors = torch.linalg.eigh(est_covariance, UPLO='U') # this is the same as saying we want our eigenvectors, with the specification that the matrix be an upper triangular matrix (instead of a lower-triangular matrix)
+    print("DONE TORCH LINALG")
     return eigenvalues.flip(0).view(-1, 1, 1, 1), eigenvectors.t().reshape(c*h*w,c,h,w).flip(0)
 
 # Run this over the training set to calculate the patch statistics, then set the initial convolution as a non-learnable 'whitening' layer
@@ -259,14 +271,18 @@ def init_whitening_conv(layer, train_set=None, num_examples=None, previous_block
 
     eigenvalue_list, eigenvector_list = [], []
     for data_split in previous_block_data_split:
+        print("Calculating whitening parameters for split of size", data_split.shape[0], "of", previous_block_data.shape[0])
         eigenvalues, eigenvectors = get_whitening_parameters(get_patches(data_split, patch_shape=layer.weight.data.shape[2:]))
+        print("DONE eigenvalues/eigenvectors")
         eigenvalue_list.append(eigenvalues)
         eigenvector_list.append(eigenvectors)
 
     eigenvalues  = torch.stack(eigenvalue_list,  dim=0).mean(0)
     eigenvectors = torch.stack(eigenvector_list, dim=0).mean(0)
+    print("HERE")
     # i believe the eigenvalues and eigenvectors come out in float32 for this because we implicitly cast it to float32 in the patches function (for numerical stability)
     set_whitening_conv(layer, eigenvalues.to(dtype=layer.weight.dtype), eigenvectors.to(dtype=layer.weight.dtype), freeze=freeze)
+    print("after_whitening")
     data = layer(previous_block_data.to(dtype=layer.weight.dtype))
     return data
 
@@ -335,7 +351,7 @@ def make_net():
     net = net.to(hyp['misc']['device'])
     net = net.to(memory_format=torch.channels_last) # to appropriately use tensor cores/avoid thrash while training
     net.train()
-    net.float().half() # Convert network to half before initializing the initial whitening layer.
+    net.half() # Convert network to half before initializing the initial whitening layer.
 
 
     ## Initialize the whitening convolution
@@ -345,7 +361,7 @@ def make_net():
                             data['train']['images'].index_select(0, torch.randperm(data['train']['images'].shape[0], device=data['train']['images'].device)),
                             num_examples=hyp['net']['whitening']['num_examples'],
                             pad_amount=hyp['net']['pad_amount'],
-                            whiten_splits=50) ## Hardcoded for now while we figure out the optimal whitening number
+                            whiten_splits=500)  ## Hardcoded for now while we figure out the optimal whitening number
                                                 ## If you're running out of memory (OOM) feel free to decrease this, but
                                                 ## the index lookup in the dataloader may give you some trouble depending
                                                 ## upon exactly how memory-limited you are
@@ -353,6 +369,7 @@ def make_net():
 
         for layer_name in net.net_dict.keys():
             if 'conv_group' in layer_name:
+                print(layer_name)
                 # Create an implicit residual via a dirac-initialized tensor
                 dirac_weights_in = torch.nn.init.dirac_(torch.empty_like(net.net_dict[layer_name].conv1.weight))
 
@@ -471,14 +488,10 @@ def get_batches(data_dict, key, batchsize, epoch_fraction=1., cutmix_size=None):
     ## Here, we prep the dataset by applying all data augmentations in batches ahead of time before each epoch, then we return an iterator below
     ## that iterates in chunks over with a random derangement (i.e. shuffled indices) of the individual examples. So we get perfectly-shuffled
     ## batches (which skip the last batch if it's not a full batch), but everything seems to be (and hopefully is! :D) properly shuffled. :)
-    if key == 'asd': # basically don'do augmentations
-        print("Hello from mixing! :D")
+    if key == 'train':
         images = batch_crop(data_dict[key]['images'], crop_size) # TODO: hardcoded image size for now?
-        print("CROP DONE :D")
         images = batch_flip_lr(images)
-        print("FLIP :D")
         images, targets = batch_cutmix(images, data_dict[key]['targets'], patch_size=cutmix_size)
-        print("HUGE CUTMIX")
     else:
         images = data_dict[key]['images']
         targets = data_dict[key]['targets']
@@ -553,8 +566,10 @@ def main():
     # Adjust pct_start based upon how many epochs we need to finetune the ema at a low lr for
     pct_start = hyp['opt']['percent_start'] #* (total_train_steps/(total_train_steps - num_low_lr_steps_for_ema))
 
+    print("MAKING NETWORK")
     # Get network
     net = make_net()
+    print("DONE MAKING NETWORK")
 
     ## Stowing the creation of these into a helper function to make things a bit more readable....
     non_bias_params, bias_params = init_split_parameter_dictionaries(net)
@@ -590,51 +605,45 @@ def main():
           cutmix_size = hyp['net']['cutmix_size'] if epoch >= hyp['misc']['train_epochs'] - hyp['net']['cutmix_epochs'] else 0
           epoch_fraction = 1 if epoch + 1 < hyp['misc']['train_epochs'] else hyp['misc']['train_epochs'] % 1 # We need to know if we're running a partial epoch or not.
 
-          print("CUTMIX", cutmix_size)
-
           for epoch_step, (inputs, targets) in enumerate(get_batches(data, key='train', batchsize=batchsize, epoch_fraction=epoch_fraction, cutmix_size=cutmix_size)):
+              print("epoch_step", epoch_step)
               ## Run everything through the network
               outputs = net(inputs)
 
-              print("here")
+              print("outputs", outputs, outputs.dtype)
+              print("targets", targets, targets.dtype)
 
               loss_batchsize_scaler = 512/batchsize # to scale to keep things at a relatively similar amount of regularization when we change our batchsize since we're summing over the whole batch
+              print("loss_batchsize_scaler", loss_batchsize_scaler)
+
               ## If you want to add other losses or hack around with the loss, you can do that here.
               loss = loss_fn(outputs, targets).mul(hyp['opt']['loss_scale_scaler']*loss_batchsize_scaler).sum().div(hyp['opt']['loss_scale_scaler']) ## Note, as noted in the original blog posts, the summing here does a kind of loss scaling
-                                                     ## (and is thus batchsize dependent as a result). This can be somewhat good or bad, depending...                            
-
-              print("loss", loss.item(), loss.dtype)
+                                                     ## (and is thus batchsize dependent as a result). This can be somewhat good or bad, depending...
+            
+            #   print("Loss here", loss)
+              print("NOPE\n")
 
               # we only take the last-saved accs and losses from train
               if epoch_step % 50 == 0:
-                  print("here ahahahahha inside")
                   train_acc = (outputs.detach().argmax(-1) == targets.argmax(-1)).float().mean().item()
                   train_loss = loss.detach().cpu().item()/(batchsize*loss_batchsize_scaler)
 
-              print("before loss")
-
               loss.backward()
 
-              print("DONE BACKWARD")
+              print("NOT FURTHER THAN HERE THOUGH")
 
               ## Step for each optimizer, in turn.
               opt.step()
               opt_bias.step()
 
-              print("DONE STEP")
-
               # We only want to step the lr_schedulers while we have training steps to consume. Otherwise we get a not-so-friendly error from PyTorch
               lr_sched.step()
               lr_sched_bias.step()
-
-              print("DONELR STEP")
 
               ## Using 'set_to_none' I believe is slightly faster (albeit riskier w/ funky gradient update workflows) than under the default 'set to zero' method
               opt.zero_grad(set_to_none=True)
               opt_bias.zero_grad(set_to_none=True)
               current_steps += 1
-
-
 
               if epoch >= ema_epoch_start and current_steps % hyp['misc']['ema']['every_n_steps'] == 0:          
                   ## Initialize the ema from the network at this point in time if it does not already exist.... :D
