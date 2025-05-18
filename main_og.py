@@ -9,7 +9,6 @@ except NameError:
   pass ## we're still good
 """
 import functools
-import time
 from functools import partial
 import math
 import os
@@ -22,12 +21,7 @@ from torch import nn
 import torchvision
 from torchvision import transforms
 
-from tinygrad import getenv, dtypes, Tensor
-from tinygrad.nn.datasets import cifar
-if getenv("TINY_BACKEND"): import tinygrad.frontend.torch
-
-# Tensor.default_type = dtypes.float32
-# torch.set_default_dtype(torch.float32) # set the default dtype to float16 for the whole file
+from tinygrad import getenv
 
 ## <-- teaching comments
 # <-- functional comments
@@ -50,13 +44,13 @@ if getenv("TINY_BACKEND"): import tinygrad.frontend.torch
 # set global defaults (in this particular file) for convolutions
 default_conv_kwargs = {'kernel_size': 3, 'padding': 'same', 'bias': False}
 
-batchsize = 1024 # should be divisible by the total number of examples
-bias_scaler = 64.0
+batchsize = 1024
+bias_scaler = 64
 # To replicate the ~95.79%-accuracy-in-110-seconds runs, you can change the base_depth from 64->128, train_epochs from 12.1->90, ['ema'] epochs 10->80, cutmix_size 3->10, and cutmix_epochs 6->80
 hyp = {
     'opt': {
-        'bias_lr':        1.525 * bias_scaler/512.0, # TODO: Is there maybe a better way to express the bias and batchnorm scaling? :'))))
-        'non_bias_lr':    1.525 / 512.0,
+        'bias_lr':        1.525 * bias_scaler/512, # TODO: Is there maybe a better way to express the bias and batchnorm scaling? :'))))
+        'non_bias_lr':    1.525 / 512,
         'bias_decay':     6.687e-4 * batchsize/bias_scaler,
         'non_bias_decay': 6.687e-4 * batchsize,
         'scaling_factor': 1./9,
@@ -66,13 +60,13 @@ hyp = {
     'net': {
         'whitening': {
             'kernel_size': 2,
-            'num_examples': 500,
+            'num_examples': 50000,
         },
         'batch_norm_momentum': .4, # * Don't forget momentum is 1 - momentum here (due to a quirk in the original paper... >:( )
-        'cutmix_size': 0,
-        'cutmix_epochs': 0,
+        'cutmix_size': 3,
+        'cutmix_epochs': 6,
         'pad_amount': 2,
-        'base_depth': 64. ## This should be a factor of 8 in some way to stay tensor core friendly
+        'base_depth': 64 ## This should be a factor of 8 in some way to stay tensor core friendly
     },
     'misc': {
         'ema': {
@@ -82,10 +76,14 @@ hyp = {
             'every_n_steps': 5,
         },
         'train_epochs': 12.1,
-        'device': 'tiny',
+        'device': 'cuda',
         'data_location': 'data.pt',
     }
 }
+
+if getenv("TINY_BACKEND"):
+    import tinygrad.frontend.torch
+    hyp["misc"]["device"] = "tiny" # Device set for tinygrad
 
 #############################################
 #                Dataloader                 #
@@ -129,12 +127,12 @@ if not os.path.exists(hyp['misc']['data_location']):
         }
 
         ## Convert dataset to FP16 now for the rest of the process....
-        data['train']['images'] = data['train']['images'].float().half().requires_grad_(False)
-        data['eval']['images']  = data['eval']['images'].float().half().requires_grad_(False)
+        data['train']['images'] = data['train']['images'].half().requires_grad_(False)
+        data['eval']['images']  = data['eval']['images'].half().requires_grad_(False)
 
         # Convert this to one-hot to support the usage of cutmix (or whatever strange label tricks/magic you desire!)
-        data['train']['targets'] = F.one_hot(data['train']['targets']).float().half()
-        data['eval']['targets'] = F.one_hot(data['eval']['targets']).float().half()
+        data['train']['targets'] = F.one_hot(data['train']['targets']).half()
+        data['eval']['targets'] = F.one_hot(data['eval']['targets']).half()
 
         torch.save(data, hyp['misc']['data_location'])
 
@@ -157,9 +155,9 @@ if hyp['net']['pad_amount'] > 0:
 #############################################
 
 # We might be able to fuse this weight and save some memory/runtime/etc, since the fast version of the network might be able to do without somehow....
-class BatchNorm(torch.nn.BatchNorm2d):
+class BatchNorm(nn.BatchNorm2d):
     def __init__(self, num_features, eps=1e-12, momentum=hyp['net']['batch_norm_momentum'], weight=False, bias=True):
-        super().__init__(num_features, eps=eps, momentum=momentum, track_running_stats=False)
+        super().__init__(num_features, eps=eps, momentum=momentum)
         self.weight.data.fill_(1.0)
         self.bias.data.fill_(0.0)
         self.weight.requires_grad = weight
@@ -337,7 +335,8 @@ def make_net():
     net = net.to(hyp['misc']['device'])
     net = net.to(memory_format=torch.channels_last) # to appropriately use tensor cores/avoid thrash while training
     net.train()
-    net.float().half() # Convert network to half before initializing the initial whitening layer.    
+    net.half() # Convert network to half before initializing the initial whitening layer.
+
 
     ## Initialize the whitening convolution
     with torch.no_grad():
@@ -346,7 +345,7 @@ def make_net():
                             data['train']['images'].index_select(0, torch.randperm(data['train']['images'].shape[0], device=data['train']['images'].device)),
                             num_examples=hyp['net']['whitening']['num_examples'],
                             pad_amount=hyp['net']['pad_amount'],
-                            whiten_splits=50) ## Hardcoded for now while we figure out the optimal whitening number
+                            whiten_splits=5000) ## Hardcoded for now while we figure out the optimal whitening number
                                                 ## If you're running out of memory (OOM) feel free to decrease this, but
                                                 ## the index lookup in the dataloader may give you some trouble depending
                                                 ## upon exactly how memory-limited you are
@@ -414,7 +413,7 @@ def make_random_square_masks(inputs, mask_size):
 
 def batch_cutmix(inputs, targets, patch_size):
     with torch.no_grad():
-        batch_permuted = torch.randperm(inputs.shape[0], device=hyp['misc']['device'])
+        batch_permuted = torch.randperm(inputs.shape[0], device='cuda')
         cutmix_batch_mask = make_random_square_masks(inputs, patch_size)
         if cutmix_batch_mask is None:
             return inputs, targets # if the mask is None, then that's because the patch size was set to 0 and we will not be using cutmix today.
@@ -464,7 +463,7 @@ class NetworkEMA(nn.Module):
 @torch.no_grad()
 def get_batches(data_dict, key, batchsize, epoch_fraction=1., cutmix_size=None):
     num_epoch_examples = len(data_dict[key]['images'])
-    shuffled = torch.randperm(num_epoch_examples, device=hyp['misc']['device']).detach()
+    shuffled = torch.randperm(num_epoch_examples, device='cuda')
     if epoch_fraction < 1:
         shuffled = shuffled[:batchsize * round(epoch_fraction * shuffled.shape[0]/batchsize)] # TODO: Might be slightly inaccurate, let's fix this later... :) :D :confetti: :fireworks:
         num_epoch_examples = shuffled.shape[0]
@@ -568,20 +567,18 @@ def main():
     lr_sched_bias = torch.optim.lr_scheduler.OneCycleLR(opt_bias, max_lr=bias_params['lr'], pct_start=pct_start, div_factor=initial_div_factor, final_div_factor=1./(initial_div_factor*final_lr_ratio), total_steps=total_train_steps, anneal_strategy='linear', cycle_momentum=False)
 
     ## For accurately timing GPU code
-    # starter, ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-    # torch.cuda.synchronize() ## clean up any pre-net setup operations
+    starter, ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    torch.cuda.synchronize() ## clean up any pre-net setup operations
 
 
     if True: ## Sometimes we need a conditional/for loop here, this is placed to save the trouble of needing to indent
         for epoch in range(math.ceil(hyp['misc']['train_epochs'])):
-        #   print(f"Epoch {epoch+1}/{math.ceil(hyp['misc']['train_epochs'])} -- {total_time_seconds:.2f} seconds elapsed")
           #################
           # Training Mode #
           #################
           torch.cuda.synchronize()
-        #   starter.record()
-        #   net.train()
-          start = time.time()
+          starter.record()
+          net.train()
 
           loss_train = None
           accuracy_train = None
@@ -590,15 +587,13 @@ def main():
           epoch_fraction = 1 if epoch + 1 < hyp['misc']['train_epochs'] else hyp['misc']['train_epochs'] % 1 # We need to know if we're running a partial epoch or not.
 
           for epoch_step, (inputs, targets) in enumerate(get_batches(data, key='train', batchsize=batchsize, epoch_fraction=epoch_fraction, cutmix_size=cutmix_size)):
-
-              print(f"COMPUTING {epoch_step+1}/{num_steps_per_epoch}")
-
+              ## Run everything through the network
               outputs = net(inputs)
 
-              loss_batchsize_scaler = 512/batchsize # to scale to keep things at a relatively similar amount of regularization when we change our batchsize since we're summing over the whole batch              
+              loss_batchsize_scaler = 512/batchsize # to scale to keep things at a relatively similar amount of regularization when we change our batchsize since we're summing over the whole batch
               ## If you want to add other losses or hack around with the loss, you can do that here.
               loss = loss_fn(outputs, targets).mul(hyp['opt']['loss_scale_scaler']*loss_batchsize_scaler).sum().div(hyp['opt']['loss_scale_scaler']) ## Note, as noted in the original blog posts, the summing here does a kind of loss scaling
-                                                     ## (and is thus batchsize dependent as a result). This can be somewhat good or bad, depending...                                          
+                                                     ## (and is thus batchsize dependent as a result). This can be somewhat good or bad, depending...
 
               # we only take the last-saved accs and losses from train
               if epoch_step % 50 == 0:
@@ -607,11 +602,9 @@ def main():
 
               loss.backward()
 
-              print(loss.item)
-
-              # steps
-              opt.step()              
-              opt_bias.step()              
+              ## Step for each optimizer, in turn.
+              opt.step()
+              opt_bias.step()
 
               # We only want to step the lr_schedulers while we have training steps to consume. Otherwise we get a not-so-friendly error from PyTorch
               lr_sched.step()
@@ -628,51 +621,37 @@ def main():
                       net_ema = NetworkEMA(net)
                       continue
                   # We warm up our ema's decay/momentum value over training exponentially according to the hyp config dictionary (this lets us move fast, then average strongly at the end).
-                  net_ema.update(net, decay=projected_ema_decay_val*(current_steps/total_train_steps)**hyp['misc']['ema']['decay_pow'])              
-            
-              if(epoch_step == 10):
-                break
+                  net_ema.update(net, decay=projected_ema_decay_val*(current_steps/total_train_steps)**hyp['misc']['ema']['decay_pow'])
 
-          end = time.time()
-          total_time_seconds += end - start
-        #   ender.record()
+          ender.record()
           torch.cuda.synchronize()
-        #   total_time_seconds += 1e-3 * starter.elapsed_time(ender)
+          total_time_seconds += 1e-3 * starter.elapsed_time(ender)
 
           ####################
           # Evaluation  Mode #
           ####################
-
-          print("EVALUATING")
           net.eval()
 
           eval_batchsize = 2500
           assert data['eval']['images'].shape[0] % eval_batchsize == 0, "Error: The eval batchsize must evenly divide the eval dataset (for now, we don't have drop_remainder implemented yet)."
-          loss_list_val, acc_list, acc_list_ema = [], [], []                    
-
-          with torch.no_grad():              
+          loss_list_val, acc_list, acc_list_ema = [], [], []
+          
+          with torch.no_grad():
               for inputs, targets in get_batches(data, key='eval', batchsize=eval_batchsize):
-                #   print(inputs)
-                #   if epoch >= ema_epoch_start:
-                #       outputs = net_ema(inputs)
-                #       print("OUT", outputs)
-                #       acc_list_ema.append((outputs.argmax(-1) == targets.argmax(-1)).float().mean())                      
+                  if epoch >= ema_epoch_start:
+                      outputs = net_ema(inputs)
+                      acc_list_ema.append((outputs.argmax(-1) == targets.argmax(-1)).float().mean())
                   outputs = net(inputs)
-                #   print("LOSS COMPUTE", outputs)                
-                  tmp_loss = loss_fn(outputs, targets).float().mean()                  
-                #   print("REALIZING")
-                  loss_list_val.append(tmp_loss)
-                  acc_list.append((outputs.argmax(-1) == targets.argmax(-1)).float().mean())              
-                                
-              val_acc = torch.stack(acc_list).mean()
-              
+                  loss_list_val.append(loss_fn(outputs, targets).float().mean())
+                  acc_list.append((outputs.argmax(-1) == targets.argmax(-1)).float().mean())
+                  
+              val_acc = torch.stack(acc_list).mean().item()
               ema_val_acc = None
               # TODO: We can fuse these two operations (just above and below) all-together like :D :))))
-            #   if epoch >= ema_epoch_start:
-            #       ema_val_acc = torch.stack(acc_list_ema).mean().item()
-              
-              val_loss = torch.stack(loss_list_val).mean().item()
+              if epoch >= ema_epoch_start:
+                  ema_val_acc = torch.stack(acc_list_ema).mean().item()
 
+              val_loss = torch.stack(loss_list_val).mean().item()
           # We basically need to look up local variables by name so we can have the names, so we can pad to the proper column width.
           ## Printing stuff in the terminal can get tricky and this used to use an outside library, but some of the required stuff seemed even
           ## more heinous than this, unfortunately. So we switched to the "more simple" version of this!
@@ -680,8 +659,6 @@ def main():
                                                     if type(locals[x]) == int else "{:0.4f}".format(locals[x]).rjust(len(x)) \
                                                 if locals[x] is not None \
                                                 else " "*len(x)
-
-          
 
           # Print out our training details (sorry for the complexity, the whole logging business here is a bit of a hot mess once the columns need to be aligned and such....)
           ## We also check to see if we're in our final epoch so we can print the 'bottom' of the table for each round.
